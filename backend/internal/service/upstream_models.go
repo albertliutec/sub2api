@@ -806,6 +806,10 @@ func (s *AccountTestService) fetchUpstreamModelListRequest(ctx context.Context, 
 		models, body, err := s.fetchAntigravityOAuthUpstreamModels(ctx, account)
 		return models, body, nil, err
 	}
+	if account.Platform == PlatformTrae {
+		models, body, err := s.fetchTraeUpstreamModels(ctx, account)
+		return models, body, nil, err
+	}
 
 	if s.httpUpstream == nil {
 		return nil, nil, nil, newUpstreamModelSyncConfigError("Upstream HTTP client is not configured", nil)

@@ -679,7 +679,7 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
     const labels = (testid: string) =>
       wrapper.get(`[data-testid="${testid}"]`).findAll('button').map(button => button.text().trim())
     expect(labels('platform-row-cn')).toEqual(['Kimi', 'Zhipu GLM', 'DeepSeek', 'MiniMax'])
-    expect(labels('platform-row-aggregators')).toEqual(['OpenCode', 'Command Code', 'Cline'])
+    expect(labels('platform-row-aggregators')).toEqual(['OpenCode', 'Command Code', 'Cline', 'Trae'])
   })
 
   it('creates a Cline account without an account type and with only the Chat Completions endpoint', async () => {
@@ -700,6 +700,32 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
       api_protocol: 'adaptive',
       base_url: 'https://api.cline.bot/api/v1',
       api_base_urls: { chat_completions: 'https://api.cline.bot/api/v1' },
+    })
+    expect(payload?.credentials).not.toHaveProperty('protocol_rules')
+    expect(payload?.credentials?.api_base_urls).not.toHaveProperty('responses')
+    expect(payload?.credentials?.api_base_urls).not.toHaveProperty('anthropic')
+  })
+
+  it('creates a Trae subscription account with its PAT and only the upstream base URL', async () => {
+    const wrapper = mountModal()
+    await wrapper.get('[data-testid="platform-button-trae"]').trigger('click')
+    // Trae 的 PAT 与订阅共用同一个凭据，协议由专用网关适配，不需要选择账号类型。
+    expect(wrapper.find('[data-testid="generic-account-mode"]').exists()).toBe(false)
+    await wrapper.get('form#create-account-form input[type="text"]').setValue('trae')
+    await wrapper.get('form#create-account-form input[type="password"]').setValue('trae-pat')
+
+    await wrapper.get('form#create-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    const payload = createAccountMock.mock.calls[0]?.[0]
+    expect(payload?.platform).toBe('trae')
+    expect(payload?.type).toBe('apikey')
+    expect(payload?.credentials).toMatchObject({
+      api_key: 'trae-pat',
+      account_mode: 'payg',
+      api_protocol: 'adaptive',
+      base_url: 'https://api.enterprise.trae.cn',
+      api_base_urls: { chat_completions: 'https://api.enterprise.trae.cn' },
     })
     expect(payload?.credentials).not.toHaveProperty('protocol_rules')
     expect(payload?.credentials?.api_base_urls).not.toHaveProperty('responses')

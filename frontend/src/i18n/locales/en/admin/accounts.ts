@@ -638,6 +638,9 @@ export default {
         official: '{platform} official API'
       },
       // OpenAI specific hints
+      trae: {
+        apiKeyHint: 'Enter a Trae Personal Access Token (PAT); the gateway exchanges it for Cloud-IDE-JWT automatically.'
+      },
       openai: {
         baseUrlHint: 'Leave default for official OpenAI API',
         apiKeyHint: 'Your OpenAI API Key',

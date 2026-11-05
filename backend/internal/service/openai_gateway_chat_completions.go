@@ -73,6 +73,18 @@ func (s *OpenAIGatewayService) forwardAsChatCompletions(
 	defaultMappedModel string,
 	compatPromptCacheTenantIsolated bool,
 ) (*OpenAIForwardResult, error) {
+	if s.isTraeAccount(account) {
+		// Cursor 等客户端可能把 Responses 形状的请求体发到 Chat Completions
+		// 端点；Trae 只有一套原生入站转换，先统一成 Chat Completions 形状。
+		if !gjson.GetBytes(body, "messages").Exists() && gjson.GetBytes(body, "input").Exists() {
+			chatBody, err := s.convertResponsesShapedChatBody(body)
+			if err != nil {
+				return nil, err
+			}
+			body = chatBody
+		}
+		return s.forwardTraeChatCompletions(ctx, c, account, body, defaultMappedModel)
+	}
 	rememberOpenCodeInboundBody(c, body)
 	beginUpstreamResponseModelObservation(c)
 	ClearActualOpenAIUpstreamEndpoint(c)

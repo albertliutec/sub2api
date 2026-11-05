@@ -385,6 +385,9 @@ func (s *AccountTestService) TestAccountConnection(c *gin.Context, accountID int
 	}
 
 	// Route to platform-specific test method
+	if account.Platform == PlatformTrae {
+		return s.testTraeAccountConnection(c, account, modelID, prompt)
+	}
 	// 按入站协议分流的多协议供应商（国产厂商等）：按账号协议选测试路径。
 	if account.RoutesProtocolByInbound() {
 		switch account.GetAPIProtocol() {

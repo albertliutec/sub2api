@@ -221,6 +221,19 @@ var providerProfiles = map[string]*ProviderProfile{
 			},
 		},
 	},
+	PlatformTrae: {
+		Platform:         PlatformTrae,
+		DefaultMode:      AccountModePayG,
+		Routing:          ProviderRoutingByInbound,
+		DefaultTestModel: "glm-5.3-flash",
+		// Trae 的协议由专门网关适配（PAT -> JWT，llm_raw_chat SSE）。这里只登记
+		// 默认 base_url 与账号类型归属，使 /v1/messages 等路由可正常分发。
+		Modes: map[string]ProviderEndpoints{
+			AccountModePayG: {
+				BaseURLs: map[string]string{APIProtocolChatCompletions: DefaultTraeBaseURL},
+			},
+		},
+	},
 }
 
 // LookupProviderProfile 返回 platform 对应的多协议供应商 profile；非此类平台返回 nil。
