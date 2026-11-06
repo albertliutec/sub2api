@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -27,6 +28,11 @@ type chatRequest struct {
 	Messages       []Message `json:"messages"`
 	Tools          []any     `json:"tools"`
 	UserInput      string    `json:"user_input"`
+
+	// Optional fields confirmed by the official Trae client's request builder.
+	ToolChoice      json.RawMessage `json:"tool_choice,omitempty"`
+	ReasoningEffort string          `json:"reasoning_effort,omitempty"`
+	Stream          *bool           `json:"stream,omitempty"`
 }
 
 type streamOutput struct {
@@ -110,8 +116,8 @@ func (c *Client) FetchImageAsDataURL(ctx context.Context, rawURL string) (string
 }
 
 // Chat executes one llm_raw_chat request. onDelta is called synchronously for
-// each text/reasoning delta.
-func (c *Client) Chat(ctx context.Context, pat, requestedModel string, messages []Message, onDelta DeltaFunc) (Outcome, error) {
+// each text/reasoning delta and onTool for each accepted tool-call increment.
+func (c *Client) Chat(ctx context.Context, pat, requestedModel string, messages []Message, opts ChatOptions, onDelta DeltaFunc, onTool ToolDeltaFunc) (Outcome, error) {
 	pat = strings.TrimSpace(pat)
 	if pat == "" {
 		return Outcome{}, newError(ErrorKindAuth, http.StatusUnauthorized, "Trae PAT is required")
@@ -141,12 +147,19 @@ func (c *Client) Chat(ctx context.Context, pat, requestedModel string, messages 
 			return onDelta(text, reasoning)
 		}
 	}
+	safeTool := onTool
+	if onTool != nil {
+		safeTool = func(delta ToolCallDelta) error {
+			pushed = true
+			return onTool(delta)
+		}
+	}
 
-	outcome, err := c.chatOnce(ctx, pat, info, messages, safeDelta)
+	outcome, err := c.chatOnce(ctx, pat, info, messages, opts, safeDelta, safeTool)
 	if err != nil {
 		if e, ok := err.(*Error); ok && e.Kind == ErrorKindAuth && !pushed {
 			c.InvalidateJWT(pat)
-			return c.chatOnce(ctx, pat, info, messages, safeDelta)
+			return c.chatOnce(ctx, pat, info, messages, opts, safeDelta, safeTool)
 		}
 		if e, ok := err.(*Error); ok && e.Kind == ErrorKindTransient && !pushed {
 			select {
@@ -154,13 +167,13 @@ func (c *Client) Chat(ctx context.Context, pat, requestedModel string, messages 
 				return Outcome{}, newError(ErrorKindAborted, 499, "client canceled the request")
 			case <-time.After(1200 * time.Millisecond):
 			}
-			return c.chatOnce(ctx, pat, info, messages, safeDelta)
+			return c.chatOnce(ctx, pat, info, messages, opts, safeDelta, safeTool)
 		}
 	}
 	return outcome, err
 }
 
-func (c *Client) chatOnce(ctx context.Context, pat string, info ModelInfo, messages []Message, onDelta DeltaFunc) (Outcome, error) {
+func (c *Client) chatOnce(ctx context.Context, pat string, info ModelInfo, messages []Message, opts ChatOptions, onDelta DeltaFunc, onTool ToolDeltaFunc) (Outcome, error) {
 	token, err := c.JWT(ctx, pat)
 	if err != nil {
 		return Outcome{}, err
@@ -169,14 +182,17 @@ func (c *Client) chatOnce(ctx context.Context, pat string, info ModelInfo, messa
 	conversationID := genConversationID()
 	sessionID := genSessionID()
 
+	stream := opts.Stream
 	payload := chatRequest{
-		ConfigName:     info.ConfigName,
-		ConversationID: conversationID,
-		ModelName:      info.ModelName,
-		SessionID:      sessionID,
-		Messages:       messages,
-		Tools:          []any{},
-		UserInput:      "",
+		ConfigName:      info.ConfigName,
+		ConversationID:  conversationID,
+		ModelName:       info.ModelName,
+		SessionID:       sessionID,
+		Messages:        messages,
+		Tools:           upstreamTools(opts.Tools),
+		ToolChoice:      opts.ToolChoice,
+		ReasoningEffort: opts.ReasoningEffort,
+		Stream:          &stream,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -290,6 +306,8 @@ func (c *Client) chatOnce(ctx context.Context, pat string, info ModelInfo, messa
 		finishReason  string
 		usage         streamUsage
 		streamErrText string
+		toolUseSeen   bool
+		toolAgg       = newToolCallAggregator()
 	)
 
 	dispatch := func() error {
@@ -319,6 +337,23 @@ func (c *Client) chatOnce(ctx context.Context, pat string, info ModelInfo, messa
 			if (partText != "" || partReasoning != "") && onDelta != nil {
 				if err := onDelta(partText, partReasoning); err != nil {
 					return err
+				}
+			}
+			if len(out.ToolCalls) > 0 {
+				var rawCalls []json.RawMessage
+				if err := json.Unmarshal(out.ToolCalls, &rawCalls); err == nil && len(rawCalls) > 0 {
+					toolUseSeen = true
+					for i, raw := range rawCalls {
+						delta, ok := normalizeToolCallItem(raw, i)
+						if !ok {
+							continue
+						}
+						if toolAgg.push(delta) && onTool != nil {
+							if err := onTool(delta); err != nil {
+								return err
+							}
+						}
+					}
 				}
 			}
 		case "token_usage":
@@ -394,6 +429,8 @@ finished:
 		FinishReason: finishReason,
 		Text:         text.String(),
 		Reasoning:    reasoning.String(),
+		ToolUseSeen:  toolUseSeen,
+		ToolCalls:    toolAgg.list(),
 		Usage: Usage{
 			PromptTokens:         usage.PromptTokens,
 			CompletionTokens:     usage.CompletionTokens,
@@ -402,4 +439,162 @@ finished:
 			CacheReadInputTokens: usage.CacheReadInputTokens,
 		},
 	}, nil
+}
+
+// upstreamTools converts normalized tool definitions into the OpenAI-nested
+// shape Trae's llm_raw_chat accepts. The parameters payload is serialized as a
+// JSON string, matching what the official client sends.
+func upstreamTools(tools []ToolDefinition) []any {
+	out := make([]any, 0, len(tools))
+	for _, tool := range tools {
+		if strings.TrimSpace(tool.Name) == "" {
+			continue
+		}
+		function := map[string]any{"name": tool.Name}
+		if strings.TrimSpace(tool.Description) != "" {
+			function["description"] = tool.Description
+		}
+		params := strings.TrimSpace(string(tool.Parameters))
+		if params == "" || !json.Valid([]byte(params)) {
+			params = `{"type":"object","properties":{}}`
+		}
+		function["parameters"] = params
+		out = append(out, map[string]any{"type": "function", "function": function})
+	}
+	return out
+}
+
+// normalizeToolCallItem converts one raw SSE tool_calls entry into a normalized
+// delta. It tolerates the upstream (function_call), OpenAI (function), flat, and
+// Anthropic (tool_use/input) shapes because the private endpoint's casing has
+// changed across IDE releases.
+func normalizeToolCallItem(raw json.RawMessage, fallbackIndex int) (ToolCallDelta, bool) {
+	var item map[string]any
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return ToolCallDelta{}, false
+	}
+	delta := ToolCallDelta{Index: fallbackIndex}
+	if idx, ok := item["index"].(float64); ok && idx >= 0 {
+		delta.Index = int(idx)
+	}
+	delta.ID = stringValue(item["id"])
+	delta.Name = stringValue(item["name"])
+	delta.Arguments = argString(item["arguments"])
+	if delta.Arguments == "" {
+		delta.Arguments = argString(item["input"])
+	}
+	for _, key := range []string{"function_call", "function"} {
+		fc, ok := item[key].(map[string]any)
+		if !ok {
+			continue
+		}
+		if name := stringValue(fc["name"]); name != "" {
+			delta.Name = name
+		}
+		if args := argString(fc["arguments"]); args != "" {
+			delta.Arguments = args
+		}
+		if args := argString(fc["partial_arguments"]); args != "" {
+			delta.Arguments = args
+		}
+	}
+	if delta.ID == "" && delta.Name == "" && delta.Arguments == "" {
+		return ToolCallDelta{}, false
+	}
+	return delta, true
+}
+
+func stringValue(value any) string {
+	s, _ := value.(string)
+	return s
+}
+
+func argString(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case map[string]any, []any:
+		raw, _ := json.Marshal(v)
+		return string(raw)
+	default:
+		return ""
+	}
+}
+
+// isCompleteJSONObject reports whether s is a fully-closed JSON object. It
+// drives the aggregator's overwrite-vs-append decision: the upstream can resend
+// a whole tool call after an internal retry, and appending that to the already
+// accumulated arguments would duplicate the JSON payload.
+func isCompleteJSONObject(s string) bool {
+	trimmed := strings.TrimSpace(s)
+	if !strings.HasPrefix(trimmed, "{") || !strings.HasSuffix(trimmed, "}") {
+		return false
+	}
+	var parsed map[string]any
+	return json.Unmarshal([]byte(trimmed), &parsed) == nil
+}
+
+// toolCallAggregator accumulates tool-call increments by index.
+type toolCallAggregator struct {
+	entries map[int]*toolCallEntry
+	order   []int
+}
+
+type toolCallEntry struct {
+	id   string
+	name string
+	args string
+}
+
+func newToolCallAggregator() *toolCallAggregator {
+	return &toolCallAggregator{entries: map[int]*toolCallEntry{}}
+}
+
+// push records one increment. It returns false when the delta carries no usable
+// data (such deltas must not be forwarded downstream).
+func (a *toolCallAggregator) push(delta ToolCallDelta) bool {
+	existing, ok := a.entries[delta.Index]
+	if !ok {
+		if delta.ID == "" && delta.Name == "" {
+			return false
+		}
+		entry := &toolCallEntry{id: delta.ID, name: delta.Name, args: delta.Arguments}
+		if entry.id == "" {
+			entry.id = fmt.Sprintf("call_%d", delta.Index)
+		}
+		a.entries[delta.Index] = entry
+		a.order = append(a.order, delta.Index)
+		return true
+	}
+	if delta.ID != "" && delta.ID != existing.id {
+		return false
+	}
+	if delta.Name != "" && delta.Name != existing.name {
+		existing.name = delta.Name
+	}
+	if delta.Arguments != "" {
+		if isCompleteJSONObject(existing.args) && isCompleteJSONObject(delta.Arguments) {
+			existing.args = strings.TrimSpace(delta.Arguments)
+		} else {
+			existing.args += delta.Arguments
+		}
+	}
+	return true
+}
+
+func (a *toolCallAggregator) list() []NormalizedToolCall {
+	sort.Ints(a.order)
+	out := make([]NormalizedToolCall, 0, len(a.order))
+	for _, index := range a.order {
+		entry := a.entries[index]
+		if entry == nil || entry.name == "" {
+			continue
+		}
+		args := entry.args
+		if args == "" {
+			args = "{}"
+		}
+		out = append(out, NormalizedToolCall{ID: entry.id, Name: entry.name, Arguments: args})
+	}
+	return out
 }

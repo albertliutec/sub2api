@@ -151,7 +151,7 @@ func TestChatConsumesTraeSSE(t *testing.T) {
 	var textParts, reasoningParts []string
 	outcome, err := testTraeClient(server).Chat(context.Background(), "pat-chat", "chat-model", []Message{{
 		Role: "user", Content: []ContentPart{{Type: "text", Text: "hi"}},
-	}}, func(text, reasoning string) error {
+	}}, ChatOptions{}, func(text, reasoning string) error {
 		if text != "" {
 			textParts = append(textParts, text)
 		}
@@ -159,7 +159,7 @@ func TestChatConsumesTraeSSE(t *testing.T) {
 			reasoningParts = append(reasoningParts, reasoning)
 		}
 		return nil
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("Chat: %v", err)
 	}
@@ -171,6 +171,88 @@ func TestChatConsumesTraeSSE(t *testing.T) {
 	}
 	if outcome.Usage.PromptTokens != 10 || outcome.Usage.CompletionTokens != 4 || outcome.Usage.TotalTokens != 14 || outcome.Usage.ReasoningTokens != 2 || outcome.Usage.CacheReadInputTokens != 3 {
 		t.Fatalf("unexpected usage: %#v", outcome.Usage)
+	}
+}
+
+func TestChatForwardsToolsAndAggregatesToolCalls(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/cloudide/api/v3/trae/oauth/ExchangeToken":
+			writeTraeToken(w, "jwt-tools")
+		case "/api/ide/v1/cli/get_config_list":
+			writeTraeModels(w)
+		case "/api/ide/v2/llm_raw_chat":
+			var payload chatRequest
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Errorf("decode chat request: %v", err)
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			if len(payload.Tools) != 1 {
+				t.Errorf("tools = %#v, want one entry", payload.Tools)
+			} else {
+				tool, _ := payload.Tools[0].(map[string]any)
+				fn, _ := tool["function"].(map[string]any)
+				if tool["type"] != "function" || fn["name"] != "get_weather" {
+					t.Errorf("unexpected tool payload: %#v", payload.Tools[0])
+				}
+				// The official client serializes parameters as a JSON string.
+				if _, ok := fn["parameters"].(string); !ok {
+					t.Errorf("parameters = %#v, want JSON string", fn["parameters"])
+				}
+			}
+			if string(payload.ToolChoice) != `"required"` {
+				t.Errorf("tool_choice = %s, want \"required\"", payload.ToolChoice)
+			}
+			if payload.ReasoningEffort != "high" {
+				t.Errorf("reasoning_effort = %q, want high", payload.ReasoningEffort)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprint(w, "event: output\ndata: {\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function_call\":{\"name\":\"get_weather\",\"partial_arguments\":\"{\\\"ci\"}}]}\n\n")
+			_, _ = fmt.Fprint(w, "event: output\ndata: {\"tool_calls\":[{\"index\":0,\"function_call\":{\"partial_arguments\":\"ty\\\":\\\"SF\\\"}\"}}]}\n\n")
+			// A retry replays the whole call; the aggregator must overwrite, not append.
+			_, _ = fmt.Fprint(w, "event: output\ndata: {\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function_call\":{\"arguments\":\"{\\\"city\\\":\\\"SF\\\"}\"}}]}\n\n")
+			_, _ = fmt.Fprint(w, "event: done\ndata: {\"finish_reason\":\"stop\"}\n\n")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var deltas []ToolCallDelta
+	outcome, err := testTraeClient(server).Chat(context.Background(), "pat-tools", "chat-model", []Message{{
+		Role: "user", Content: []ContentPart{{Type: "text", Text: "weather?"}},
+	}}, ChatOptions{
+		Tools: []ToolDefinition{{
+			Name:        "get_weather",
+			Description: "Look up the weather",
+			Parameters:  json.RawMessage(`{"type":"object","properties":{"city":{"type":"string"}}}`),
+		}},
+		ToolChoice:      json.RawMessage(`"required"`),
+		ReasoningEffort: "high",
+		Stream:          true,
+	}, nil, func(delta ToolCallDelta) error {
+		deltas = append(deltas, delta)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if !outcome.ToolUseSeen {
+		t.Fatalf("ToolUseSeen = false, want true")
+	}
+	if len(outcome.ToolCalls) != 1 {
+		t.Fatalf("tool calls = %#v, want one", outcome.ToolCalls)
+	}
+	call := outcome.ToolCalls[0]
+	if call.ID != "call_a" || call.Name != "get_weather" || call.Arguments != `{"city":"SF"}` {
+		t.Fatalf("unexpected tool call: %#v", call)
+	}
+	if len(deltas) != 3 {
+		t.Fatalf("deltas = %d, want 3", len(deltas))
+	}
+	if deltas[0].Index != 0 || deltas[0].Name != "get_weather" {
+		t.Fatalf("first delta = %#v", deltas[0])
 	}
 }
 
@@ -199,7 +281,7 @@ func TestChatRetriesExpiredJWTAuthFailure(t *testing.T) {
 
 	outcome, err := testTraeClient(server).Chat(context.Background(), "pat-auth", "chat-model", []Message{{
 		Role: "user", Content: []ContentPart{{Type: "text", Text: "hi"}},
-	}}, nil)
+	}}, ChatOptions{}, nil, nil)
 	if err != nil {
 		t.Fatalf("Chat: %v", err)
 	}
@@ -240,7 +322,7 @@ func TestChatRefreshesJWTWhenModelRegistryRejectsCachedToken(t *testing.T) {
 
 	outcome, err := testTraeClient(server).Chat(context.Background(), "pat-registry-auth", "chat-model", []Message{{
 		Role: "user", Content: []ContentPart{{Type: "text", Text: "hi"}},
-	}}, nil)
+	}}, ChatOptions{}, nil, nil)
 	if err != nil {
 		t.Fatalf("Chat: %v", err)
 	}
@@ -270,7 +352,7 @@ func TestChatRejectsImagesForNonMultimodalModel(t *testing.T) {
 			{Type: "text", Text: "what is this?"},
 			{Type: "image_url", ImageURL: &ImageURL{URL: "data:image/png;base64,AA=="}},
 		},
-	}}, nil)
+	}}, ChatOptions{}, nil, nil)
 	e, ok := err.(*Error)
 	if !ok || e.Kind != ErrorKindBadRequest {
 		t.Fatalf("error = %#v, want bad_request", err)

@@ -186,6 +186,108 @@ func traeFinishReason(reason string) string {
 // Inbound conversion helpers
 // ---------------------------------------------------------------------------
 
+// traeOutcomeFinishReason prefers the upstream finish_reason but reports
+// tool_calls whenever the model produced tool calls and no explicit reason.
+func traeOutcomeFinishReason(outcome trae.Outcome) string {
+	reason := traeFinishReason(outcome.FinishReason)
+	if reason == "stop" && (outcome.ToolUseSeen || len(outcome.ToolCalls) > 0) {
+		return "tool_calls"
+	}
+	return reason
+}
+
+// traeToolChoiceNone reports whether tool_choice disables tool use. Both the
+// string form ("none") and the object form ({"type":"none"}) are accepted.
+func traeToolChoiceNone(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var choice string
+	if err := json.Unmarshal(raw, &choice); err == nil {
+		return strings.EqualFold(strings.TrimSpace(choice), "none")
+	}
+	var obj struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		return strings.EqualFold(strings.TrimSpace(obj.Type), "none")
+	}
+	return false
+}
+
+func traeToolsFromChat(req *apicompat.ChatCompletionsRequest) []trae.ToolDefinition {
+	if req == nil || len(req.Tools) == 0 || traeToolChoiceNone(req.ToolChoice) {
+		return nil
+	}
+	out := make([]trae.ToolDefinition, 0, len(req.Tools))
+	for _, tool := range req.Tools {
+		if tool.Function == nil || strings.TrimSpace(tool.Function.Name) == "" {
+			continue
+		}
+		out = append(out, trae.ToolDefinition{
+			Name:        tool.Function.Name,
+			Description: tool.Function.Description,
+			Parameters:  tool.Function.Parameters,
+		})
+	}
+	return out
+}
+
+// traeChatOptions builds the optional upstream fields for one request.
+func traeChatOptions(req *apicompat.ChatCompletionsRequest) trae.ChatOptions {
+	if req == nil {
+		return trae.ChatOptions{}
+	}
+	opts := trae.ChatOptions{
+		Tools:           traeToolsFromChat(req),
+		ReasoningEffort: strings.TrimSpace(req.ReasoningEffort),
+		Stream:          req.Stream,
+	}
+	// tool_choice is only forwarded alongside surviving tools: the upstream
+	// rejects a choice that references tools it never received.
+	if len(opts.Tools) > 0 && len(req.ToolChoice) > 0 && !traeToolChoiceNone(req.ToolChoice) {
+		opts.ToolChoice = req.ToolChoice
+	}
+	return opts
+}
+
+func traeChatToolCalls(calls []trae.NormalizedToolCall) []apicompat.ChatToolCall {
+	if len(calls) == 0 {
+		return nil
+	}
+	out := make([]apicompat.ChatToolCall, 0, len(calls))
+	for index, call := range calls {
+		idx := index
+		args := strings.TrimSpace(call.Arguments)
+		if args == "" {
+			args = "{}"
+		}
+		out = append(out, apicompat.ChatToolCall{
+			Index: &idx,
+			ID:    call.ID,
+			Type:  "function",
+			Function: apicompat.ChatFunctionCall{
+				Name:      call.Name,
+				Arguments: args,
+			},
+		})
+	}
+	return out
+}
+
+func traeChatToolCallDelta(delta trae.ToolCallDelta) apicompat.ChatToolCall {
+	idx := delta.Index
+	return apicompat.ChatToolCall{
+		Index: &idx,
+		ID:    delta.ID,
+		Type:  "function",
+		Function: apicompat.ChatFunctionCall{
+			Name:      delta.Name,
+			Arguments: delta.Arguments,
+		},
+	}
+}
+
 func (s *OpenAIGatewayService) traeMessagesFromChat(ctx context.Context, client *trae.Client, req *apicompat.ChatCompletionsRequest) ([]trae.Message, error) {
 	items := make([]trae.Message, 0, len(req.Messages)+1)
 	if strings.TrimSpace(req.Instructions) != "" {
@@ -282,6 +384,7 @@ func (s *OpenAIGatewayService) forwardTraeChatCompletions(ctx context.Context, c
 		writeChatCompletionsError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return nil, err
 	}
+	opts := traeChatOptions(&req)
 
 	responseID := randomHexID("chatcmpl-", 12)
 	created := time.Now().Unix()
@@ -309,7 +412,7 @@ func (s *OpenAIGatewayService) forwardTraeChatCompletions(ctx context.Context, c
 	}
 
 	if !req.Stream {
-		outcome, err := client.Chat(ctx, traePAT(account), billingModel, messages, nil)
+		outcome, err := client.Chat(ctx, traePAT(account), billingModel, messages, opts, nil, nil)
 		if err != nil {
 			return nil, s.traeForwardError(c, APIProtocolChatCompletions, err, written)
 		}
@@ -325,8 +428,9 @@ func (s *OpenAIGatewayService) forwardTraeChatCompletions(ctx context.Context, c
 					Role:             "assistant",
 					Content:          content,
 					ReasoningContent: outcome.Reasoning,
+					ToolCalls:        traeChatToolCalls(outcome.ToolCalls),
 				},
-				FinishReason: traeFinishReason(outcome.FinishReason),
+				FinishReason: traeOutcomeFinishReason(outcome),
 			}},
 			Usage: traeChatUsage(outcome.Usage),
 		}
@@ -367,13 +471,25 @@ func (s *OpenAIGatewayService) forwardTraeChatCompletions(ctx context.Context, c
 		return nil
 	}
 
-	outcome, err := client.Chat(ctx, traePAT(account), billingModel, messages, emit)
+	emitTool := func(delta trae.ToolCallDelta) error {
+		if firstTokenMs == nil {
+			elapsed := int(time.Since(startTime).Milliseconds())
+			firstTokenMs = &elapsed
+		}
+		writeChunk(apicompat.ChatCompletionsChunk{
+			ID: responseID, Object: "chat.completion.chunk", Created: created, Model: originalModel,
+			Choices: []apicompat.ChatChunkChoice{{Index: 0, Delta: apicompat.ChatDelta{ToolCalls: []apicompat.ChatToolCall{traeChatToolCallDelta(delta)}}}},
+		})
+		return nil
+	}
+
+	outcome, err := client.Chat(ctx, traePAT(account), billingModel, messages, opts, emit, emitTool)
 	if err != nil {
 		return nil, s.traeForwardError(c, APIProtocolChatCompletions, err, written)
 	}
 	writeChunk(apicompat.ChatCompletionsChunk{
 		ID: responseID, Object: "chat.completion.chunk", Created: created, Model: originalModel,
-		Choices: []apicompat.ChatChunkChoice{{Index: 0, Delta: apicompat.ChatDelta{Role: "assistant"}, FinishReason: traeStringPtr(traeFinishReason(outcome.FinishReason))}},
+		Choices: []apicompat.ChatChunkChoice{{Index: 0, Delta: apicompat.ChatDelta{Role: "assistant"}, FinishReason: traeStringPtr(traeOutcomeFinishReason(outcome))}},
 		Usage:   traeChatUsage(outcome.Usage),
 	})
 	writeHeaders()
@@ -428,6 +544,7 @@ func (s *OpenAIGatewayService) forwardTraeAnthropic(ctx context.Context, c *gin.
 		writeAnthropicError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return nil, err
 	}
+	opts := traeChatOptions(chatReq)
 	responseID := randomHexID("msg_", 12)
 	created := time.Now().Unix()
 	var firstTokenMs *int
@@ -478,14 +595,14 @@ func (s *OpenAIGatewayService) forwardTraeAnthropic(ctx context.Context, c *gin.
 	}
 
 	if !clientStream {
-		outcome, err := client.Chat(ctx, traePAT(account), billingModel, messages, nil)
+		outcome, err := client.Chat(ctx, traePAT(account), billingModel, messages, opts, nil, nil)
 		if err != nil {
 			return nil, s.traeForwardError(c, APIProtocolAnthropic, err, false)
 		}
 		content, _ := json.Marshal(outcome.Text)
 		cc := &apicompat.ChatCompletionsResponse{
 			ID: responseID, Object: "chat.completion", Created: created, Model: originalModel,
-			Choices: []apicompat.ChatChoice{{Index: 0, Message: apicompat.ChatMessage{Role: "assistant", Content: content, ReasoningContent: outcome.Reasoning}, FinishReason: traeFinishReason(outcome.FinishReason)}},
+			Choices: []apicompat.ChatChoice{{Index: 0, Message: apicompat.ChatMessage{Role: "assistant", Content: content, ReasoningContent: outcome.Reasoning, ToolCalls: traeChatToolCalls(outcome.ToolCalls)}, FinishReason: traeOutcomeFinishReason(outcome)}},
 			Usage:   traeChatUsage(outcome.Usage),
 		}
 		c.JSON(http.StatusOK, apicompat.ChatCompletionsResponseToAnthropic(cc, originalModel))
@@ -503,13 +620,24 @@ func (s *OpenAIGatewayService) forwardTraeAnthropic(ctx context.Context, c *gin.
 		}, nil
 	}
 
-	outcome, err := client.Chat(ctx, traePAT(account), billingModel, messages, emit)
+	emitTool := func(delta trae.ToolCallDelta) error {
+		if firstTokenMs == nil {
+			elapsed := int(time.Since(startTime).Milliseconds())
+			firstTokenMs = &elapsed
+		}
+		emitChunk(&apicompat.ChatCompletionsChunk{
+			ID: responseID, Object: "chat.completion.chunk", Created: created, Model: originalModel,
+			Choices: []apicompat.ChatChunkChoice{{Index: 0, Delta: apicompat.ChatDelta{ToolCalls: []apicompat.ChatToolCall{traeChatToolCallDelta(delta)}}}},
+		})
+		return nil
+	}
+	outcome, err := client.Chat(ctx, traePAT(account), billingModel, messages, opts, emit, emitTool)
 	if err != nil {
 		return nil, s.traeForwardError(c, APIProtocolAnthropic, err, wrote)
 	}
 	emitChunk(&apicompat.ChatCompletionsChunk{
 		ID: responseID, Object: "chat.completion.chunk", Created: created, Model: originalModel,
-		Choices: []apicompat.ChatChunkChoice{{Index: 0, FinishReason: traeStringPtr(traeFinishReason(outcome.FinishReason))}},
+		Choices: []apicompat.ChatChunkChoice{{Index: 0, FinishReason: traeStringPtr(traeOutcomeFinishReason(outcome))}},
 		Usage:   traeChatUsage(outcome.Usage),
 	})
 	for _, event := range apicompat.FinalizeChatCompletionsAnthropicStream(state) {
@@ -579,6 +707,7 @@ func (s *OpenAIGatewayService) forwardTraeResponses(ctx context.Context, c *gin.
 		writeOpenAIResponsesFallbackError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return nil, err
 	}
+	opts := traeChatOptions(chatReq)
 	responseID := randomHexID("resp_", 12)
 	created := time.Now().Unix()
 	var firstTokenMs *int
@@ -639,14 +768,14 @@ func (s *OpenAIGatewayService) forwardTraeResponses(ctx context.Context, c *gin.
 	}
 
 	if !clientStream {
-		outcome, err := client.Chat(ctx, traePAT(account), billingModel, messages, nil)
+		outcome, err := client.Chat(ctx, traePAT(account), billingModel, messages, opts, nil, nil)
 		if err != nil {
 			return nil, s.traeForwardError(c, APIProtocolResponses, err, false)
 		}
 		content, _ := json.Marshal(outcome.Text)
 		cc := &apicompat.ChatCompletionsResponse{
 			ID: responseID, Object: "chat.completion", Created: created, Model: originalModel,
-			Choices: []apicompat.ChatChoice{{Index: 0, Message: apicompat.ChatMessage{Role: "assistant", Content: content, ReasoningContent: outcome.Reasoning}, FinishReason: traeFinishReason(outcome.FinishReason)}},
+			Choices: []apicompat.ChatChoice{{Index: 0, Message: apicompat.ChatMessage{Role: "assistant", Content: content, ReasoningContent: outcome.Reasoning, ToolCalls: traeChatToolCalls(outcome.ToolCalls)}, FinishReason: traeOutcomeFinishReason(outcome)}},
 			Usage:   traeChatUsage(outcome.Usage),
 		}
 		responsesResp := apicompat.ChatCompletionsResponseToResponses(cc, originalModel, customTools, functionTools, toolSearch, namespaceTools)
@@ -667,13 +796,24 @@ func (s *OpenAIGatewayService) forwardTraeResponses(ctx context.Context, c *gin.
 		}, nil
 	}
 
-	outcome, err := client.Chat(ctx, traePAT(account), billingModel, messages, emit)
+	emitTool := func(delta trae.ToolCallDelta) error {
+		if firstTokenMs == nil {
+			elapsed := int(time.Since(startTime).Milliseconds())
+			firstTokenMs = &elapsed
+		}
+		emitChunk(&apicompat.ChatCompletionsChunk{
+			ID: responseID, Object: "chat.completion.chunk", Created: created, Model: originalModel,
+			Choices: []apicompat.ChatChunkChoice{{Index: 0, Delta: apicompat.ChatDelta{ToolCalls: []apicompat.ChatToolCall{traeChatToolCallDelta(delta)}}}},
+		})
+		return nil
+	}
+	outcome, err := client.Chat(ctx, traePAT(account), billingModel, messages, opts, emit, emitTool)
 	if err != nil {
 		return nil, s.traeForwardError(c, APIProtocolResponses, err, wrote)
 	}
 	emitChunk(&apicompat.ChatCompletionsChunk{
 		ID: responseID, Object: "chat.completion.chunk", Created: created, Model: originalModel,
-		Choices: []apicompat.ChatChunkChoice{{Index: 0, FinishReason: traeStringPtr(traeFinishReason(outcome.FinishReason))}},
+		Choices: []apicompat.ChatChunkChoice{{Index: 0, FinishReason: traeStringPtr(traeOutcomeFinishReason(outcome))}},
 		Usage:   traeChatUsage(outcome.Usage),
 	})
 	writeEvents(apicompat.FinalizeChatCompletionsResponsesStream(state))
