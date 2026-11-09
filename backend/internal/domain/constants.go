@@ -37,7 +37,10 @@ const (
 	PlatformCommandCode = "command_code"
 	// PlatformCline 是 Cline API（多模型聚合，OpenAI 兼容 Chat Completions；按量积分计费，
 	// 另有 ClinePass 订阅）。
-	PlatformCline     = "cline"
+	PlatformCline = "cline"
+	// PlatformTrae 是 Trae IDE / CLI 的订阅账号（使用 PAT 换取 Cloud-IDE-JWT，
+	// 经 OpenAI 网关对外提供 Chat Completions / Messages / Responses）。
+	PlatformTrae      = "trae"
 	PlatformComposite = "composite"
 )
 

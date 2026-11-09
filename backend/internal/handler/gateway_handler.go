@@ -1506,6 +1506,8 @@ func defaultModelIDsForPlatform(platform string) []string {
 		return xai.DefaultModelIDs()
 	case service.PlatformOpenCodeGo:
 		return service.DefaultOpenCodeGoModelIDs()
+	case service.PlatformTrae:
+		return service.DefaultTraeModelIDs()
 	case service.PlatformTypeSafe:
 		return []string{"jev-latest"}
 	case service.PlatformComposite:

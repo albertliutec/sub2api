@@ -756,6 +756,9 @@ export default {
         official: '{platform} 官方 API'
       },
       // OpenAI specific hints
+      trae: {
+        apiKeyHint: '填写 Trae 个人访问令牌（PAT）；网关会自动用它换取 Cloud-IDE-JWT。'
+      },
       openai: {
         baseUrlHint: '留空使用官方 OpenAI API',
         apiKeyHint: '您的 OpenAI API Key',

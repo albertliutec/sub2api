@@ -7,24 +7,27 @@ import (
 )
 
 // 重构前各处手写的平台列表，作为平台清单派生结果的等价基准；重构后新登记的平台
-// （Command Code、Cline）按同类平台（OpenCode）的位置补入。
+// （Command Code、Cline、Trae）按同类平台的位置补入。
 var (
 	legacyDisplayOrder = []string{
 		PlatformAnthropic, PlatformOpenAI, PlatformGemini, PlatformAntigravity, PlatformGrok,
 		PlatformKimi, PlatformZhipu, PlatformDeepseek, PlatformMiniMax, PlatformOpenCodeGo, PlatformTypeSafe,
 		PlatformCommandCode,
 		PlatformCline,
+		PlatformTrae,
 	}
 	legacyCompositePrecedence = []string{
 		PlatformAnthropic, PlatformGemini, PlatformOpenAI, PlatformAntigravity, PlatformGrok,
 		PlatformKimi, PlatformZhipu, PlatformDeepseek, PlatformMiniMax, PlatformOpenCodeGo, PlatformTypeSafe,
 		PlatformCommandCode,
 		PlatformCline,
+		PlatformTrae,
 	}
 	legacyOpenAIGateway = []string{
 		PlatformOpenAI, PlatformGrok, PlatformKimi, PlatformZhipu, PlatformDeepseek, PlatformMiniMax, PlatformOpenCodeGo,
 		PlatformCommandCode,
 		PlatformCline,
+		PlatformTrae,
 	}
 	legacyCNProviders    = []string{PlatformKimi, PlatformZhipu, PlatformDeepseek, PlatformMiniMax}
 	legacyLiteLLMByPlatf = map[string]string{
@@ -32,6 +35,7 @@ var (
 		PlatformAntigravity: "anthropic", PlatformGrok: "xai", PlatformKimi: "moonshot",
 		PlatformZhipu: "zhipu", PlatformDeepseek: "deepseek", PlatformMiniMax: "minimax",
 		PlatformOpenCodeGo: "opencode-go", PlatformTypeSafe: "typesafe", PlatformCommandCode: "", PlatformCline: "",
+		PlatformTrae: "",
 	}
 )
 

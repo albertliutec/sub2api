@@ -278,6 +278,24 @@
           }
         ]
       }
+    },
+    {
+      "id": "trae",
+      "display_name": "Trae",
+      "gateway": "openai",
+      "cn_provider": false,
+      "multi_protocol": {
+        "default_mode": "payg",
+        "routing": "by_inbound",
+        "modes": [
+          {
+            "mode": "payg",
+            "base_urls": {
+              "chat_completions": "https://api.enterprise.trae.cn"
+            }
+          }
+        ]
+      }
     }
   ],
   "composite_precedence": [
@@ -293,6 +311,7 @@
     "opencode_go",
     "typesafe",
     "command_code",
-    "cline"
+    "cline",
+    "trae"
   ]
 }
