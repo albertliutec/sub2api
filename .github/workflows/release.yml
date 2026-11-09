@@ -27,6 +27,24 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Check SSH reachability
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_PORT: ${{ secrets.SSH_PORT }}
+        run: |
+          set -u
+          if [ -z "${SSH_HOST:-}" ] || [ -z "${SSH_PORT:-}" ]; then
+            echo "SSH_HOST or SSH_PORT secret is missing" >&2
+            exit 1
+          fi
+          echo "probing ${SSH_HOST}:${SSH_PORT}"
+          if timeout 15 bash -c "cat < /dev/null > /dev/tcp/${SSH_HOST}/${SSH_PORT}"; then
+            echo "TCP reachable"
+          else
+            echo "TCP UNREACHABLE from GitHub runner" >&2
+            exit 1
+          fi
+
       - uses: docker/setup-buildx-action@v3
 
       - name: Login to OCI registry
